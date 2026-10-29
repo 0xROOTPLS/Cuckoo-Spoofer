@@ -1,11 +1,8 @@
-; cuckoo_thunk.asm (v3.2). Plants chain on cu_dispatch's local alloc, jmps
-; target. Target's ret to BTITN+0x14 fires #DB, cu_veh pivots back.
-;
-; Mid-call chain: target -> BTITN+0x14 -> RtlUTS+0x21 -> 0.
+; cuckoo_thunk.asm (v3.2). cu_dispatch: arm HW BP, plant chain, jmp target.
 
 OPTION DOTNAME
 
-; CU_SPOOFER offsets -- must match cuckoo.h.
+; CU_SPOOFER offsets; keep in sync with cuckoo.h.
 CU_SPOOF_FN          EQU 000h
 CU_FAKE_L1           EQU 008h
 CU_FAKE_L2           EQU 010h
@@ -25,8 +22,8 @@ EXTERN cu_arm_hwbp:PROC
 
 .code
 
-; cu_dispatch(rcx=&s). 8 nonvol push + 0x108 alloc -> body_rsp 0 mod 16.
-; planted_top = body_rsp + slot_a (0x18) -> 8 mod 16 (Win64 ABI for jmp entry).
+; cu_dispatch(rcx=&s): 8 pushes + 0x108 alloc -> body_rsp % 16 == 0.
+; planted_top = body_rsp + slot_a (0x18) -> 8 mod 16 (Win64 jmp entry).
 PUBLIC cu_dispatch
 PUBLIC cu_dispatch_continuation
 cu_dispatch PROC FRAME
@@ -52,6 +49,14 @@ cu_dispatch PROC FRAME
 
     mov     [rcx + CU_SAVED_RSP], rsp
 
+    ; Arm at body_rsp; the alloc's first 20h bytes are the shadow space, so no
+    ; RSP adjustment. Plant after the call to keep SlotA and UNWIND_INFO.
+    mov     r12, rcx
+    call    cu_arm_hwbp
+    test    eax, eax
+    jnz     cu_dispatch_fail
+    mov     rcx, r12
+
     ; plant SlotA=L1(BTITN+0x14), SlotB=L2(RtlUTS+0x21), SlotC=0
     mov     rax, [rcx + CU_FAKE_L1]
     mov     rdx, [rcx + CU_SLOT_A]
@@ -64,15 +69,6 @@ cu_dispatch PROC FRAME
     xor     rax, rax
     mov     rdx, [rcx + CU_SLOT_C]
     mov     [rsp + rdx], rax
-
-    ; r12 carries &s across cu_arm_hwbp (already saved by our prolog).
-    mov     r12, rcx
-    sub     rsp, 20h
-    call    cu_arm_hwbp
-    add     rsp, 20h
-    test    eax, eax
-    jnz     cu_dispatch_fail
-    mov     rcx, r12
 
     mov     r10, [rcx + CU_SLOT_A]
     add     r10, rsp                 ; r10 = planted_top
@@ -90,7 +86,7 @@ cu_dispatch PROC FRAME
     mov     rsp, r10
     jmp     rax
 
-    ; cu_arm_hwbp failed -- skip pivot, return 0.
+    ; arm failed: skip pivot, return 0.
 cu_dispatch_fail:
     mov     rcx, r12
     xor     rax, rax

