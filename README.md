@@ -28,7 +28,7 @@ First, `RtlVirtualUnwind` only reads what is on the regular stack at the moment 
 
 Second, hardware breakpoints are per-thread debug-register state, settable by the thread itself via `SetThreadContext` on its own handle. A breakpoint placed on the address that the spoofed return chain claims as the parent will fire as `EXCEPTION_SINGLE_STEP` the moment the target API tries to return through it.
 
-Combine the two. Plant a fabricated chain on the regular stack before pivoting into the target API. Set a hardware execute breakpoint on the planted "parent" address. Run the API. Catch the trap in a vectored exception handler. Redirect execution back into a continuation labelled inside the dispatcher's own frame. Unwind through the dispatcher's truthful UNWIND_INFO.
+Combine the two. Set a hardware execute breakpoint on the address the fabricated chain will claim as its parent, plant the chain on the regular stack, then pivot into the target API. Catch the trap in a vectored exception handler. Redirect execution back into a continuation labelled inside the dispatcher's own frame. Unwind through the dispatcher's truthful UNWIND_INFO.
 
 Nothing in the unwind data lies. Nothing in any DLL's memory has been written.
 
@@ -42,7 +42,7 @@ cu_dispatch PROC FRAME
     .pushreg r15
     push    r14
     .pushreg r14
-    ; ... seven more pushes for nonvol GPRs ...
+    ; ... six more pushes for nonvol GPRs ...
     sub     rsp, 108h
     .allocstack 108h
     .endprolog
@@ -56,17 +56,18 @@ planted_top + 0x08 : SlotB (next walked frame: RtlUTS+0x21)
 planted_top + 0x10 : SlotC (terminator: 0)
 ```
 
-The remaining bytes serve as scratch space and to keep the alignment honest. After the prologue completes and the slot writes settle, RSP is congruent to 8 modulo 16, which is exactly what the target API will expect on entry.
+The remaining bytes serve as scratch space and to keep the alignment honest. After the prologue completes, the dispatcher's own frame is 16-byte aligned; the pivot then sets RSP to `planted_top`, which is congruent to 8 modulo 16, exactly what the target API expects on entry.
 
 The shape of the planted region is the only delicate arithmetic in the technique. Win64 ABI requires that the callee see RSP congruent to 8 modulo 16 when its first instruction executes, with a 32 byte shadow space and arguments five and onward at `[rsp+0x28]` upward. Cuckoo's pivot must land RSP exactly there relative to the SlotA/B/C plant, which is why the argument count is capped at five. The sixth argument slot would collide with SlotB.
 
 ## Arming the breakpoint
 
-`cu_arm_hwbp` is a thin C helper called from `cu_dispatch` once the chain is planted. It does three things in sequence.
+`cu_arm_hwbp` is a thin C helper called from `cu_dispatch` before the chain is planted. It does four things in sequence.
 
-1. Stash the active `CU_SPOOFER` pointer in a TLS slot. The vectored handler will need it to find the saved RSP and the continuation address.
+1. Reject the call if the thread's TLS already holds an armed `CU_SPOOFER` (a nested or overlapping call on the same thread); `cuckoo_call` then returns NULL.
 2. `GetThreadContext` on the calling thread's pseudo-handle, then scan DR7 for the lowest free `L_n` enable bit. A free slot is one whose enable bit is zero, regardless of what content sits in the corresponding DRn register.
-3. Write the planted SlotA value (BTITN+0x14) into the chosen DRn, set its `L_n` bit in DR7, and clear the R/W and LEN fields for that slot to encode an execute breakpoint (R/W = 00, LEN = 00). `SetThreadContext` commits the change.
+3. Stash the active `CU_SPOOFER` pointer in a TLS slot. The vectored handler needs it to find the saved RSP and the continuation address; it is released when the call completes.
+4. Write the L1 value (BTITN+0x14) into the chosen DRn, set its `L_n` bit in DR7, and clear the R/W and LEN fields for that slot to encode an execute breakpoint (R/W = 00, LEN = 00). `SetThreadContext` commits the change.
 
 The free-slot scan exists for a specific reason. Hardcoding DR0 collides with EDR runtimes that own one or more debug-register slots for their own hooks. Stomping a slot that the EDR is actively using produces both a missed hook on the EDR side and a guaranteed alert on the spoofer's side. Picking the lowest free slot avoids that vector entirely as long as at least one of the four slots is still available, which is the common case.
 
@@ -74,7 +75,7 @@ The chosen slot index goes back into the `CU_SPOOFER` struct so the handler late
 
 ## The pivot
 
-After `cu_arm_hwbp` returns successfully, `cu_dispatch` loads the target function pointer into RAX, the up-to-five arguments into RCX/RDX/R8/R9 plus the fifth into the appropriate stack slot, then:
+After `cu_arm_hwbp` returns successfully, `cu_dispatch` plants the three slots, loads the target function pointer into RAX, the up-to-five arguments into RCX/RDX/R8/R9 plus the fifth into the appropriate stack slot, then:
 
 ```asm
 mov     rsp, r10        ; r10 was loaded with the planted top
@@ -85,23 +86,25 @@ Note the `jmp`, not `call`. A CALL would push the post-call return address insid
 
 ## The handler
 
-The vectored exception handler `cu_veh` receives every exception in the process. It only acts when three conditions all hold:
+The vectored exception handler `cu_veh` receives every exception in the process. It only acts when all of these hold:
 
 1. The exception code is `EXCEPTION_SINGLE_STEP` (`0x80000004`).
-2. The DR6 hit bit corresponding to `s->DrSlot` is set.
-3. The TLS slot for the active `CU_SPOOFER` is non-null.
+2. `ExceptionAddress` is the armed L1 address.
+3. The TLS slot for the active `CU_SPOOFER` is non-null and its slot index is valid.
+4. The DR6 hit bit corresponding to `s->DrSlot` is set.
 
 Failing any of these, the handler returns `EXCEPTION_CONTINUE_SEARCH` and the exception flows to whatever the process or system would have done with it normally. The handler is a strict filter, not a swallower.
 
-When all three conditions hold, the handler performs five steps.
+When all conditions hold, the handler performs these steps.
 
-1. Stash the target API's return value (currently in RAX of the exception context) into `s->ReturnValue`.
-2. Disarm the chosen DR slot by clearing its `L_n` bit in DR7 and its hit bit in DR6.
-3. Restore RSP from `s->SavedRsp`, the value `cu_dispatch` saved before pivoting.
-4. Set `Rip` to `cu_dispatch_continuation`, a public label inside `cu_dispatch` that sits between the JMP and the truthful epilog.
-5. Return `EXCEPTION_CONTINUE_EXECUTION`.
+1. Save the thread's last-error value around the TLS accesses, and copy the target API's return value (currently in RAX of the exception context) into `s->ReturnValue`.
+2. Release the TLS owner so the thread can arm another call.
+3. Disarm the chosen DR slot by clearing its `L_n` bit in DR7 and its hit bit in DR6.
+4. Restore RSP from `s->SavedRsp`, the value `cu_dispatch` saved before pivoting.
+5. Set RCX to the active `CU_SPOOFER` and `Rip` to `cu_dispatch_continuation`, a public label inside `cu_dispatch` that sits between the JMP and the truthful epilog.
+6. Return `EXCEPTION_CONTINUE_EXECUTION`.
 
-The CPU resumes at the continuation. RAX is reloaded from `s->ReturnValue`, the `add rsp, 108h` reverses the prologue's allocation, the nine `pop` instructions reverse the nonvol saves, and `ret` pops the original caller's return address off the regular stack and returns. From the outside, `cu_dispatch` is a normal Win64 function that took some arguments and returned a value. Its UNWIND_INFO matches its actual prologue exactly.
+The CPU resumes at the continuation. RAX is reloaded from `s->ReturnValue`, the `add rsp, 108h` reverses the prologue's allocation, the eight `pop` instructions reverse the nonvol saves, and `ret` pops the original caller's return address off the regular stack and returns. From the outside, `cu_dispatch` is a normal Win64 function that took some arguments and returned a value. Its UNWIND_INFO matches its actual prologue exactly.
 
 ## What the call tree looks like
 
@@ -120,15 +123,17 @@ After the API returns and the handler redirects execution back into `cu_dispatch
 
 ## Threading
 
-Each thread that calls into cuckoo arms its own DR slot via its own TLS-stored `CU_SPOOFER`. Slots are picked independently per thread; threads do not coordinate. A thread that already owns DR0, DR1, DR2 from prior arms picks DR3, and so on until all four are taken, at which point `cu_arm_hwbp` returns failure and `cu_dispatch` unwinds without calling the target. In practice no caller has more than one cuckoo call in flight at a time, so contention is theoretical.
+Each thread that calls into cuckoo arms its own DR slot via its own TLS-stored `CU_SPOOFER`. Slots are picked independently per thread; threads do not coordinate, and the slot is released when the call completes. A thread whose TLS already holds an armed call rejects a second, overlapping call (nested callback, APC, or fiber) and `cuckoo_call` returns NULL instead of corrupting the TLS pointer. A thread whose slots are held elsewhere (for example by an EDR) picks the lowest free slot; if all four are taken, `cu_arm_hwbp` returns failure and `cu_dispatch` unwinds without calling the target.
 
-The vectored handler is process-wide, registered once at `cuckoo::init()`. It distinguishes its own traps from anyone else's via the TLS slot test and the DR6 hit-bit test, both per-thread state. An EDR or another library that uses hardware breakpoints in unrelated threads is not interfered with.
+The vectored handler is process-wide, registered once at `cuckoo_init()`. It distinguishes its own traps from anyone else's via the L1 address, TLS slot, and DR6 hit-bit tests, all per-thread state. An EDR or another library that uses hardware breakpoints in unrelated threads is not interfered with.
+
+`cuckoo_clear()` drains in-flight calls (blocking for the target's duration) before removing the handler and freeing the TLS index. Calls that start during teardown fail fast, and a clear issued from inside a spoofed call on the same thread is a no-op so that call's handler remains available.
 
 ## Why the unwind data does not lie
 
 This is the piece that distinguishes cuckoo from BYOUD and from anything that fakes UNWIND_INFO.
 
-`cu_dispatch` is a real function. Its `.pushreg`, `.allocstack`, and `.endprolog` directives describe its prologue accurately. A walker that lands inside `cu_dispatch` (during the epilog or at the continuation label) gets a perfectly accurate frame. A walker that lands inside the target API at any point during the spoofed-chain window does not see `cu_dispatch` at all, because the planted frame above the target API claims `BTITN+0x14` as the parent, and `BaseThreadInitThunk`'s own truthful UNWIND_INFO carries the walker the rest of the way to `RtlUserThreadStart`.
+`cu_dispatch` is a real function. Its `.pushreg`, `.allocstack`, and `.endprolog` directives describe its prologue accurately. A walker that lands inside `cu_dispatch` (during the epilog or at the continuation label) gets a perfectly accurate frame. The helper that arms the breakpoint is called at the prologue's stack pointer (the allocation's first 0x20 bytes serve as its shadow space) and the slots are planted afterwards, so no unrecorded RSP adjustment exists during arming either. A walker that lands inside the target API at any point during the spoofed-chain window does not see `cu_dispatch` at all, because the planted frame above the target API claims `BTITN+0x14` as the parent, and `BaseThreadInitThunk`'s own truthful UNWIND_INFO carries the walker the rest of the way to `RtlUserThreadStart`.
 
 Every UNWIND_INFO consulted along the spoofed chain is the genuine, on-disk, byte-identical UNWIND_INFO of a Microsoft-shipped function. None of them have been touched. The lie is in execution flow (the target API was called from cu_dispatch, not from BTITN), not in metadata.
 
@@ -218,10 +223,12 @@ Plausibility of (parent_function, child_API) pairs. `BaseThreadInitThunk+0x14` a
 
 ## Limitations
 
-* Five argument cap. The sixth would collide with SlotB in the planted region. Fixable by enlarging the plant and shifting the slot offsets, at the cost of a wider plant footprint.
-* One in-flight call per thread. Two cuckoo calls overlapping on the same thread would corrupt the TLS pointer. The macro-level API does not allow this in practice, since cuckoo blocks until the target returns.
+* Five argument cap. On current builds the sixth argument slot (`planted_top+0x30`) collides with SlotB. Fixable by enlarging the plant and shifting the slot offsets, at the cost of a wider plant footprint.
+* One in-flight call per thread. Overlapping calls are detected and rejected: the inner `cuckoo_call` returns NULL. A call that never returns through the planted frame (for example `ExitThread`/`TerminateThread`, or a VEH that redirects instead of unwinding) leaks the in-flight count, so `cuckoo_clear` can block; if the thread survives, its DR slot and TLS stay armed and later calls on it fail.
 * `/CETCOMPAT` processes are unsupported.
 * The DR slot must be available. Four slots total per thread, and EDRs commonly hold one or two of them. Three coexisting EDRs holding all four leaves cuckoo no room.
+* Exceptions raised inside the target cannot be caught by SEH frames around `cuckoo_call`; the fabricated chain omits the real caller frames. Only a process-wide VEH (or a handler inside the target) can intercept them.
+* Init requires the L1 symbol's unwind frame (`BaseThreadInitThunk` by default) to be at least 0x28 bytes so SlotB clears the target's shadow space and the fifth-argument slot. Current builds use 0x28; a build with a smaller frame fails init cleanly.
 * No support yet for varargs APIs whose stack-arg layout depends on runtime types (the `printf` family). The fixed five-arg ABI handles every standard Win32 API.
 
 ## Status
